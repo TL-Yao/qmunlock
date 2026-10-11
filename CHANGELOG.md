@@ -4,6 +4,13 @@ All notable changes to QM Unlock are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve the nearest existing ancestor for missing output paths so symlink aliases (including macOS `/var`) produce stable history keys before and after directory creation.
+- Dispatch folder scans away from the UI thread; cache history indexes, prune missing outputs, cap history at 10,000 records and save once per batch. Add a history clearing control and document local paths and metadata network requests.
+- Continue monitoring through temporary directory/entry errors and acknowledge files only after successful queue insertion; retry failed scans/acks without losing or duplicating files. Wait for encrypted downloads to have valid footers.
+- Restore credential preflight for encrypted-only batches and bound template filenames by UTF-8 bytes rather than character count.
+
 ### Added
 
 - Watch a QQ Music download directory and automatically queue new or changed files after two stable polls; use a separate output directory and serialize conversion batches.

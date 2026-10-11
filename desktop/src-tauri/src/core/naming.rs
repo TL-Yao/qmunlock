@@ -37,7 +37,7 @@ pub fn validate(template: &str) -> Result<()> {
 }
 
 fn safe(value: &str) -> String {
-    let value: String = value
+    let mut value: String = value
         .chars()
         .map(|c| {
             if c.is_control() || "<>:\"/\\|?*{}".contains(c) {
@@ -46,8 +46,14 @@ fn safe(value: &str) -> String {
                 c
             }
         })
-        .take(100)
         .collect();
+    // Reserve room for the extension, collision suffix and Windows-name prefix.
+    // Bound UTF-8 bytes, while truncating only at a Unicode character boundary.
+    let mut end = value.len().min(200);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
     let value = value.trim().trim_end_matches(['.', ' ']);
     if value.is_empty() || value == "." || value == ".." {
         return "未知".into();
@@ -212,6 +218,37 @@ mod tests {
         assert_ne!(target, source);
         assert_eq!(std::fs::read(&source).unwrap(), b"source");
         assert_eq!(std::fs::read(target).unwrap(), b"copy");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unicode_names_fit_byte_limits_and_leave_room_for_collision_suffixes() {
+        let value = safe(&"中文歌名🎵".repeat(100));
+        assert!(value.len() <= 200);
+        assert!(!value.is_empty());
+        assert!(format!("{value} (123456789).flac").len() <= 255);
+        let dir = std::env::temp_dir().join(format!("qm-unicode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("input.mp3");
+        let output = dir.join("copy.mp3");
+        std::fs::write(&input, b"source").unwrap();
+        std::fs::write(&output, b"copy").unwrap();
+        let meta = tags::EmbeddedTags {
+            title: "歌".repeat(200),
+            artist: String::new(),
+            album: String::new(),
+        };
+        let target = apply(
+            &output,
+            &input,
+            Some(&dir),
+            Some("{title}"),
+            None,
+            Some(&meta),
+        )
+        .unwrap();
+        assert!(target.file_name().unwrap().to_str().unwrap().len() <= 255);
+        assert_eq!(std::fs::read(&target).unwrap(), b"copy");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

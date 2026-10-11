@@ -7,6 +7,8 @@ use tauri::{Emitter, Manager};
 
 pub struct BatchLock(pub tokio::sync::Mutex<()>);
 #[derive(Default)]
+pub struct HistoryCache(pub std::sync::Mutex<Option<automation::History>>);
+#[derive(Default)]
 pub struct WatchState(pub std::sync::Mutex<Option<automation::FolderWatcher>>);
 
 fn history_path(app: &tauri::AppHandle) -> Option<PathBuf> {
@@ -16,7 +18,56 @@ fn history_path(app: &tauri::AppHandle) -> Option<PathBuf> {
         .map(|p| p.join("processing-history.json"))
 }
 
-#[tauri::command]
+fn history_snapshot(app: &tauri::AppHandle) -> automation::History {
+    let state = app.state::<HistoryCache>();
+    let mut cache = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .get_or_insert_with(|| {
+            history_path(app)
+                .as_deref()
+                .map(automation::History::load)
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
+fn cached_outputs(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let state = app.state::<HistoryCache>();
+    let mut cache = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .get_or_insert_with(|| {
+            history_path(app)
+                .as_deref()
+                .map(automation::History::load)
+                .unwrap_or_default()
+        })
+        .outputs()
+}
+
+#[tauri::command(async)]
+pub fn clear_processing_history(app: tauri::AppHandle) -> std::result::Result<(), String> {
+    let batch = app.state::<BatchLock>();
+    let _batch = batch
+        .0
+        .try_lock()
+        .map_err(|_| "请等待当前批次完成后再清除记录".to_owned())?;
+    let store = history_path(&app).ok_or("无法定位处理记录目录")?;
+    for path in [store.clone(), store.with_extension("tmp")] {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.to_string());
+            }
+        }
+    }
+    *app.state::<HistoryCache>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(automation::History::default());
+    Ok(())
+}
+
+// Tauri dispatches these blocking filesystem operations away from its UI thread.
+#[tauri::command(async)]
 pub fn set_watch_directory(
     state: tauri::State<WatchState>,
     directory: Option<String>,
@@ -29,13 +80,24 @@ pub fn set_watch_directory(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
+pub fn acknowledge_watch_files(
+    state: tauri::State<WatchState>,
+    files: Vec<automation::WatchFile>,
+) -> std::result::Result<(), String> {
+    if let Some(watcher) = state.0.lock().map_err(|e| e.to_string())?.as_mut() {
+        watcher.acknowledge(&files);
+    }
+    Ok(())
+}
+
+#[tauri::command(async)]
 pub fn poll_watch_directory(
     app: tauri::AppHandle,
     state: tauri::State<WatchState>,
     batch: tauri::State<BatchLock>,
     output_dir: Option<String>,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<Vec<automation::WatchFile>, String> {
     let Ok(_batch) = batch.0.try_lock() else {
         return Ok(Vec::new());
     };
@@ -43,10 +105,8 @@ pub fn poll_watch_directory(
     let Some(watcher) = state.as_mut() else {
         return Ok(Vec::new());
     };
-    let mut excluded = history_path(&app)
-        .map(|p| automation::History::load(&p).outputs())
-        .unwrap_or_default();
-    if let Some(output) = output_dir.and_then(|p| std::fs::canonicalize(p).ok()) {
+    let mut excluded = cached_outputs(&app);
+    if let Some(output) = output_dir.map(|p| automation::canonical_path(Path::new(&p))) {
         if output != watcher.root() && output.starts_with(watcher.root()) {
             excluded.push(output);
         }
@@ -199,7 +259,7 @@ pub struct ScanResult {
     pub infos: Vec<FileInfo>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn scan_paths(app: tauri::AppHandle, paths: Vec<String>) -> ScanResult {
     let inputs = expand_paths(paths);
     let total = inputs.len().max(1) as u64;
@@ -258,10 +318,9 @@ pub async fn decrypt_paths(
                 .collect();
         }
     }
-    let store = history_path(&app);
-    let mut history = store
-        .as_deref()
-        .map(automation::History::load)
+    let history_app = app.clone();
+    let mut history = tauri::async_runtime::spawn_blocking(move || history_snapshot(&history_app))
+        .await
         .unwrap_or_default();
     let output = output_dir.as_deref().map(Path::new);
     let credentials = if options
@@ -325,12 +384,26 @@ pub async fn decrypt_paths(
         if in_place || source_version == automation::stamp(input) {
             history.record(key, input, &result);
         }
-        if let Some(store) = store.as_deref() {
-            if let Err(error) = history.save(store) {
-                eprintln!("无法保存处理记录：{error}");
-            }
-        }
         results.push(result);
+    }
+    let history_app = app.clone();
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        history.prune();
+        let result = history_path(&history_app)
+            .map(|store| history.save(&store))
+            .transpose();
+        *history_app
+            .state::<HistoryCache>()
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(history);
+        result
+    })
+    .await;
+    match saved {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => eprintln!("无法保存处理记录：{error}"),
+        Err(error) => eprintln!("处理记录任务异常：{error}"),
     }
     emit_frac(&app, "complete", "", total, total, 1.0, "任务处理完成");
     results

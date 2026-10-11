@@ -68,6 +68,7 @@ type ProgressEvent = {
 };
 
 type ScanResult = { files: string[]; infos: FileInfo[] };
+type WatchFile = { path: string; version: string };
 
 const THEME_KEY = "qm-theme";
 const AUTOMATION_KEY = "qm-automation";
@@ -131,6 +132,8 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const processing = useRef(false);
   const polling = useRef(false);
+  const acceptedWatchVersions = useRef(new Map<string, string>());
+  const [automationBusy, setAutomationBusy] = useState(false);
   const watchOutput = useRef(outputDir);
   watchOutput.current = outputDir;
   const [lyricsDir, setLyricsDir] = useState("");
@@ -313,19 +316,23 @@ export default function App() {
   };
 
   const toggleWatch = async () => {
+    if (processing.current || automationBusy) return;
+    setAutomationBusy(true);
     setSettingsOpen(true);
     try {
       if (watching) {
         await invoke("set_watch_directory", { directory: null });
-        setWatching(false); setWatchPending([]); return;
+        setWatching(false); setWatchPending([]); acceptedWatchVersions.current.clear(); return;
       }
       const picked = await open({ directory: true, multiple: false, defaultPath: watchDir || undefined, title: "选择 QQ 音乐下载目录" });
       if (typeof picked !== "string") return;
       const destination = !outputDir || sameDirectory(outputDir, picked) ? picked.replace(/[\\/]$/, "") + "/QM Unlock 输出" : outputDir;
       await invoke("set_watch_directory", { directory: picked });
+      acceptedWatchVersions.current.clear();
       setOutputDir(destination); setWatchDir(picked); setWatching(true);
       setNotice("已开始监听；已有文件请手动添加，新文件稳定后自动处理"); setNoticeBad(false);
     } catch (error) { setNotice("监听失败：" + String(error)); setNoticeBad(true); }
+    finally { setAutomationBusy(false); }
   };
 
   useEffect(() => {
@@ -336,20 +343,41 @@ export default function App() {
       polling.current = true;
       void (async () => {
         try {
-          const files = await invoke<string[]>("poll_watch_directory", { outputDir: watchOutput.current || null });
+          const files = await invoke<WatchFile[]>("poll_watch_directory", { outputDir: watchOutput.current || null });
           if (cancelled || !files.length) return;
-          const result = await scanIncoming(files);
-          if (!cancelled && result) {
-            const ready = result.infos.filter(info => info.supported).map(info => info.path);
-            setWatchPending(old => uniquePaths([...old, ...ready]));
+          const unaccepted = files.filter(file => acceptedWatchVersions.current.get(file.path) !== file.version);
+          if (unaccepted.length) {
+            const result = await scanIncoming(unaccepted.map(file => file.path));
+            if (cancelled) return;
+            if (result) {
+              const ready = result.infos.filter(info => info.supported).map(info => info.path);
+              setWatchPending(old => uniquePaths([...old, ...ready]));
+              for (const file of unaccepted) {
+                if (ready.includes(file.path)) acceptedWatchVersions.current.set(file.path, file.version);
+              }
+            }
           }
+          // Ack only after successful scan and queue insertion. If this RPC fails,
+          // retry the ack on the next poll without enqueueing the same version twice.
+          const accepted = files.filter(file => acceptedWatchVersions.current.get(file.path) === file.version);
+          if (!cancelled && accepted.length) await invoke("acknowledge_watch_files", { files: accepted });
         } catch (error) {
-          if (!cancelled) { setNotice("监听已暂停：" + String(error)); setNoticeBad(true); setWatching(false); }
+          if (!cancelled) { setNotice("监听暂时失败，将继续重试：" + String(error)); setNoticeBad(true); }
         } finally { polling.current = false; }
       })();
     }, 2000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [watching, scanIncoming]);
+
+  const clearHistory = async () => {
+    if (processing.current || automationBusy) return;
+    setAutomationBusy(true);
+    try {
+      await invoke("clear_processing_history");
+      setNotice("已清除处理记录，音乐文件保留；下次将重新识别已有输出"); setNoticeBad(false);
+    } catch (error) { setNotice("清除记录失败：" + String(error)); setNoticeBad(true); }
+    finally { setAutomationBusy(false); }
+  };
 
   const chooseLyricsDir = async () => {
     const picked = await open({ directory: true, multiple: false });
@@ -408,9 +436,18 @@ export default function App() {
 
   const runBatch = async (batch: string[], automatic = false) => {
     if (!batch.length || processing.current) return;
+    const batchHasEnc = batch.some(path => fileInfo[path]?.kind === "enc");
+    const batchHasPlain = batch.some(path => fileInfo[path]?.kind === "plain");
+    if (batchHasEnc && !batchHasPlain) {
+      if (keyMode === "manual" && !manualKey.trim()) {
+        setNotice("请粘贴 ekey，或切换为自动获取"); setNoticeBad(true); return;
+      }
+      if (keyMode === "automatic" && !credentials?.available) {
+        setNotice(credentials?.message || "正在检测 QQ 音乐登录信息，请稍后重试"); setNoticeBad(true); return;
+      }
+    }
     processing.current = true;
     setWatchPending(old => old.filter(path => !batch.includes(path)));
-    const batchHasEnc = batch.some(path => fileInfo[path]?.kind === "enc");
     setNotice(undefined);
     setNoticeBad(false);
     setRunning(true);
@@ -480,7 +517,8 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  const canStart = visiblePaths.length > 0 && !running;
+  const keyReady = hasPlain || (keyMode === "manual" ? Boolean(manualKey.trim()) : Boolean(credentials?.available));
+  const canStart = visiblePaths.length > 0 && keyReady && !running;
   const state = dragActive ? "drag" : paths.length || settingsOpen ? "loaded" : "empty";
   const permissionRequired = credentials?.state === "permission_required";
   const failedJob = jobs.find((row) => !row.result.ok && fileInfo[row.result.input]?.kind !== "plain")?.result;
@@ -553,7 +591,7 @@ export default function App() {
               <div className="acts">
                 <button className="ghost" onClick={() => void chooseFiles()}>选择文件</button>
                 <button className="ghost" onClick={() => void chooseFolder()}>文件夹</button>
-                <button className="ghost" onClick={() => void toggleWatch()}>{watching ? "停止监听" : "监听文件夹"}</button>
+                <button className="ghost" disabled={running || automationBusy} onClick={() => void toggleWatch()}>{watching ? "停止监听" : "监听文件夹"}</button>
               </div>
               <section className={`auth-guide${credentials?.available ? " ready" : ""}${permissionRequired ? " required" : ""}`} aria-label="自动解密状态与使用说明">
                 <div className="auth-guide-head">
@@ -643,13 +681,15 @@ export default function App() {
         <aside className="side">
           <div className="card automation">
             <p className="ch">自动处理</p>
-            <button className="ghost watch-toggle" disabled={running || polling.current} onClick={() => void toggleWatch()}>{watching ? "停止监听" : "选择并监听下载目录"}</button>
+            <button className="ghost watch-toggle" disabled={running || automationBusy} onClick={() => void toggleWatch()}>{watching ? "停止监听" : "选择并监听下载目录"}</button>
             <p className="setting-note" title={watchDir}>{watching ? "正在监听：" : "上次目录："}{watchDir || "未选择"}</p>
-            <p className="setting-note">每 2 秒检查一次，新文件连续两次保持稳定后自动处理。已有文件请手动添加。</p>
+            <p className="setting-note">每 2 秒后台检查一次，连续两次稳定且格式就绪后自动处理。已有文件请手动添加。</p>
             {watchPending.length > 0 && <p className="setting-note" role="status">等待处理 {watchPending.length} 个文件{!running ? "；加密文件需登录 QQ 音乐或填写 ekey" : ""}</p>}
             <button className="opt first" aria-pressed={skipExisting} onClick={() => setSkipExisting(v => !v)}>
               <span className="box"><Check size={9} strokeWidth={4} /></span><span>跳过已转换文件</span>
             </button>
+            <p className="setting-note">处理记录在本机保存输入/输出完整路径，最多保留 10,000 条。</p>
+            <button className="ghost watch-toggle" disabled={running || automationBusy} onClick={() => void clearHistory()}>清除处理记录</button>
           </div>
           <div className="card automation">
             <p className="ch">输出命名</p>

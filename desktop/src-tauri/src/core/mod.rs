@@ -1,7 +1,9 @@
+pub mod automation;
 pub mod credentials;
 pub mod decrypt;
 pub mod ekey;
 pub mod footer;
+pub mod naming;
 pub mod qmc2;
 pub mod tags;
 
@@ -32,12 +34,14 @@ pub struct FileInfo {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptResult {
     pub input: String,
     pub output: Option<String>,
     pub ok: bool,
+    #[serde(default)]
+    pub skipped: bool,
     pub format: Option<String>,
     pub error: Option<String>,
     /// 封面处理结果（仅在启用写封面时有值）
@@ -64,6 +68,10 @@ pub struct ProgressEvent {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DecryptOptions {
+    #[serde(default = "default_skip_existing")]
+    pub skip_existing: bool,
+    #[serde(default)]
+    pub output_template: Option<String>,
     pub output_mode: OutputMode,
     pub manual_ekey: Option<String>,
     /// 输出后写入专辑封面（FLAC；macOS 同时设置访达图标）
@@ -82,6 +90,10 @@ pub struct DecryptOptions {
     /// 普通音频是否先复制副本再增强（false 表示原位写入）
     #[serde(default)]
     pub plain_copy: bool,
+}
+
+fn default_skip_existing() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -4,6 +4,13 @@ All notable changes to QM Unlock are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Watch a QQ Music download directory and automatically queue new or changed files after two stable polls; use a separate output directory and serialize conversion batches.
+- Skip previously converted sources and known generated outputs using local processing history and existing-output checks, with an opt-out for reprocessing.
+- Output naming presets and custom {filename}, {artist}, {title}, {album}, {track} templates with safe subdirectories, metadata fallback and source preservation.
+- Persist automation preferences without storing ekeys or login credentials.
+
 ## [2.1.0] - 2026-10-10
 
 ### 升级须知（macOS，必读）

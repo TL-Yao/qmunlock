@@ -40,3 +40,6 @@ GPL FFmpeg。
   读取凭据，权限不足时才提示管理员启动。
 - ekey 和登录令牌仅用于当前进程，不写入日志、磁盘或任务历史。
 - 自动获取失败时可以在界面手动粘贴 ekey。
+
+- 目录监听、成功处理记录和安全命名模板见根目录 README 的「目录监听、跳过与命名」。处理记录保存到 Tauri app_data_dir 的 processing-history.json；偏好保存在 WebView localStorage，重启不会自动恢复监听。
+- 新模块 core/automation.rs 负责文件稳定检测与历史复用，core/naming.rs 负责模板校验、元数据回退和输出副本命名；批次共用异步互斥锁，监听轮询在处理期间暂停。

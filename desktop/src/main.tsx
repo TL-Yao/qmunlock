@@ -42,6 +42,7 @@ type DecryptResult = {
   input: string;
   output?: string;
   ok: boolean;
+  skipped?: boolean;
   format?: string;
   error?: string;
   cover?: string;
@@ -69,6 +70,22 @@ type ProgressEvent = {
 type ScanResult = { files: string[]; infos: FileInfo[] };
 
 const THEME_KEY = "qm-theme";
+const AUTOMATION_KEY = "qm-automation";
+function savedAutomation(): { outputDir?: string; watchDir?: string; template?: string; skipExisting?: boolean } {
+  try {
+    const value = JSON.parse(localStorage.getItem(AUTOMATION_KEY) || "{}");
+    return {
+      outputDir: typeof value?.outputDir === "string" ? value.outputDir : "",
+      watchDir: typeof value?.watchDir === "string" ? value.watchDir : "",
+      template: typeof value?.template === "string" ? value.template : "",
+      skipExisting: typeof value?.skipExisting === "boolean" ? value.skipExisting : true,
+    };
+  } catch { return {}; }
+}
+function sameDirectory(a: string, b: string) {
+  const normalize = (path: string) => path.replace(/^\\\\\?\\/, "").replace(/\\/g, "/").replace(/\/$/, "");
+  return /^[a-z]:/i.test(a) ? normalize(a).toLowerCase() === normalize(b).toLowerCase() : normalize(a) === normalize(b);
+}
 
 /// 进度阶段 → 界面上的两字标签。行内只显示阶段，不显示百分比，
 /// 百分比属于「整批任务」，放在底栏与顶部进度线上。
@@ -104,7 +121,18 @@ function initialTheme(): Theme {
 export default function App() {
   const [paths, setPaths] = useState<string[]>([]);
   const [fileInfo, setFileInfo] = useState<Record<string, FileInfo>>({});
-  const [outputDir, setOutputDir] = useState("");
+  const [saved] = useState(savedAutomation);
+  const [outputDir, setOutputDir] = useState(saved.outputDir || "");
+  const [watchDir, setWatchDir] = useState(saved.watchDir || "");
+  const [watching, setWatching] = useState(false);
+  const [watchPending, setWatchPending] = useState<string[]>([]);
+  const [skipExisting, setSkipExisting] = useState(saved.skipExisting ?? true);
+  const [outputTemplate, setOutputTemplate] = useState(saved.template || "");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const processing = useRef(false);
+  const polling = useRef(false);
+  const watchOutput = useRef(outputDir);
+  watchOutput.current = outputDir;
   const [lyricsDir, setLyricsDir] = useState("");
   const [mode, setMode] = useState<OutputMode>("original");
   const [keyMode, setKeyMode] = useState<KeyMode>("automatic");
@@ -138,6 +166,10 @@ export default function App() {
       /* 忽略隐私模式下的写入失败 */
     }
   }, [theme]);
+
+  useEffect(() => {
+    try { localStorage.setItem(AUTOMATION_KEY, JSON.stringify({ outputDir, watchDir, template: outputTemplate, skipExisting })); } catch { /* Storage may be unavailable. */ }
+  }, [outputDir, watchDir, outputTemplate, skipExisting]);
 
   // macOS 改用 overlay 标题栏：原生红绿灯叠进自绘顶栏，
   // 并清空系统标题，避免「系统标题一行 + 自绘品牌字一行」的重复。
@@ -226,6 +258,7 @@ export default function App() {
         ...old,
         ...Object.fromEntries(result.infos.map((info) => [info.path, info])),
       }));
+      return result;
     } catch (error) {
       setNotice(`扫描失败：${String(error)}`);
       setNoticeBad(true);
@@ -271,8 +304,52 @@ export default function App() {
 
   const chooseOutput = async () => {
     const picked = await open({ directory: true, multiple: false });
-    if (typeof picked === "string") setOutputDir(picked);
+    if (typeof picked === "string") {
+      if (watching && sameDirectory(picked, watchDir)) {
+        setNotice("监听时请将输出放在独立目录或子目录，避免产物再次进入队列"); setNoticeBad(true); return;
+      }
+      setOutputDir(picked);
+    }
   };
+
+  const toggleWatch = async () => {
+    setSettingsOpen(true);
+    try {
+      if (watching) {
+        await invoke("set_watch_directory", { directory: null });
+        setWatching(false); setWatchPending([]); return;
+      }
+      const picked = await open({ directory: true, multiple: false, defaultPath: watchDir || undefined, title: "选择 QQ 音乐下载目录" });
+      if (typeof picked !== "string") return;
+      const destination = !outputDir || sameDirectory(outputDir, picked) ? picked.replace(/[\\/]$/, "") + "/QM Unlock 输出" : outputDir;
+      await invoke("set_watch_directory", { directory: picked });
+      setOutputDir(destination); setWatchDir(picked); setWatching(true);
+      setNotice("已开始监听；已有文件请手动添加，新文件稳定后自动处理"); setNoticeBad(false);
+    } catch (error) { setNotice("监听失败：" + String(error)); setNoticeBad(true); }
+  };
+
+  useEffect(() => {
+    if (!watching) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      if (processing.current || polling.current) return;
+      polling.current = true;
+      void (async () => {
+        try {
+          const files = await invoke<string[]>("poll_watch_directory", { outputDir: watchOutput.current || null });
+          if (cancelled || !files.length) return;
+          const result = await scanIncoming(files);
+          if (!cancelled && result) {
+            const ready = result.infos.filter(info => info.supported).map(info => info.path);
+            setWatchPending(old => uniquePaths([...old, ...ready]));
+          }
+        } catch (error) {
+          if (!cancelled) { setNotice("监听已暂停：" + String(error)); setNoticeBad(true); setWatching(false); }
+        } finally { polling.current = false; }
+      })();
+    }, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [watching, scanIncoming]);
 
   const chooseLyricsDir = async () => {
     const picked = await open({ directory: true, multiple: false });
@@ -289,6 +366,7 @@ export default function App() {
   };
 
   const removePath = (path: string) => {
+    setWatchPending(old => old.filter(item => item !== path));
     setPaths((old) => old.filter((item) => item !== path));
     setFileInfo((old) => {
       const next = { ...old };
@@ -298,6 +376,8 @@ export default function App() {
   };
 
   const clearAll = () => {
+    if (processing.current) return;
+    setWatchPending([]);
     setPaths([]);
     setFileInfo({});
     setJobs([]);
@@ -326,45 +406,37 @@ export default function App() {
   const plainWritesNew = mode === "mp3" || plainPaths.some((path) => !path.toLowerCase().endsWith(`.${fileInfo[path]?.format}`));
   const isMac = os === "macos";
 
-  const start = async () => {
-    if (!visiblePaths.length || running) return;
-    // 只有全是加密文件时才因缺 ekey 拦下；混合队列照常开始，未加密的不受影响，
-    // 加密的会在各自行里报出缺 ekey 的原因
-    if (hasEnc && !hasPlain) {
-      if (keyMode === "manual" && !manualKey.trim()) {
-        setNotice("请粘贴 ekey，或切换为自动获取");
-        setNoticeBad(true);
-        return;
-      }
-      if (keyMode === "automatic" && !credentials?.available) {
-        setNotice(credentials?.message || "正在检测 QQ 音乐登录信息，请稍后重试");
-        setNoticeBad(true);
-        return;
-      }
-    }
+  const runBatch = async (batch: string[], automatic = false) => {
+    if (!batch.length || processing.current) return;
+    processing.current = true;
+    setWatchPending(old => old.filter(path => !batch.includes(path)));
+    const batchHasEnc = batch.some(path => fileInfo[path]?.kind === "enc");
     setNotice(undefined);
     setNoticeBad(false);
     setRunning(true);
-    setJobs([]);
+    setJobs(old => old.filter(row => !batch.includes(row.result.input)));
     setProgress(undefined);
     try {
       const result = await invoke<DecryptResult[]>("decrypt_paths", {
-        paths: visiblePaths,
+        paths: batch,
         outputDir: outputDir || null,
         options: {
           output_mode: mode,
-          manual_ekey: hasEnc && keyMode === "manual" ? manualKey.trim() : null,
+          manual_ekey: batchHasEnc && keyMode === "manual" ? manualKey.trim() : null,
           embed_cover: embedCover,
           fetch_lyrics: fetchLyrics,
           lyrics_dir: fetchLyrics && lyricsDir ? lyricsDir : null,
           embed_synced_lyrics: fetchLyrics && embedSyncedLyrics,
-          plain_copy: plainCopy,
+          plain_copy: automatic || watching || plainCopy || Boolean(outputTemplate.trim()),
+          skip_existing: skipExisting,
+          output_template: outputTemplate.trim() || null,
         },
       });
-      setJobs(result.map((r) => ({ result: r })));
+      setJobs(old => [...old.filter(row => !batch.includes(row.result.input)), ...result.map(r => ({ result: r }))]);
       const ok = result.filter((r) => r.ok).length;
       const fail = result.length - ok;
-      setNotice(fail > 0 ? `${ok}/${result.length} 完成 · ${fail} 失败` : `${ok}/${result.length} 完成`);
+      const skipped = result.filter(r => r.skipped).length;
+      setNotice(`${ok - skipped} 完成 · ${skipped} 跳过${fail ? ` · ${fail} 失败` : ""}`);
       setNoticeBad(fail > 0);
     } catch (error) {
       setJobs((old) => [
@@ -374,10 +446,22 @@ export default function App() {
       setNotice(`任务失败：${String(error)}`);
       setNoticeBad(true);
     } finally {
+      processing.current = false;
       setRunning(false);
       void refreshCredentials();
     }
   };
+
+  const start = () => runBatch(visiblePaths);
+  const runBatchRef = useRef(runBatch);
+  runBatchRef.current = runBatch;
+  useEffect(() => {
+    if (!watching || running || processing.current || !watchPending.length) return;
+    const ready = watchPending.filter(path => fileInfo[path]?.kind !== "enc" || (keyMode === "manual" ? Boolean(manualKey.trim()) : Boolean(credentials?.available)));
+    if (!ready.length) return;
+    setWatchPending(old => old.filter(path => !ready.includes(path)));
+    void runBatchRef.current(ready, true);
+  }, [watching, running, watchPending, fileInfo, keyMode, manualKey, credentials]);
 
   // ⌘O 添加文件、⌘↩ 开始：让顶栏的快捷键提示是真的，而不是装饰
   useEffect(() => {
@@ -396,9 +480,8 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  const keyReady = hasPlain || (keyMode === "manual" ? manualKey.trim().length > 0 : Boolean(credentials?.available));
-  const canStart = visiblePaths.length > 0 && keyReady && !running;
-  const state = dragActive ? "drag" : paths.length ? "loaded" : "empty";
+  const canStart = visiblePaths.length > 0 && !running;
+  const state = dragActive ? "drag" : paths.length || settingsOpen ? "loaded" : "empty";
   const permissionRequired = credentials?.state === "permission_required";
   const failedJob = jobs.find((row) => !row.result.ok && fileInfo[row.result.input]?.kind !== "plain")?.result;
   const jobByPath = useMemo(() => {
@@ -419,6 +502,7 @@ export default function App() {
           // 顶栏是拖拽区；按钮区域阻止 mousedown 冒泡，避免点按钮时误触发窗口拖动
           onMouseDown={(event) => event.stopPropagation()}
         >
+          <button className="ghost" onClick={() => setSettingsOpen(v => !v)}>设置</button>
           <button
             className="ico-btn"
             title="切换深浅色"
@@ -469,6 +553,7 @@ export default function App() {
               <div className="acts">
                 <button className="ghost" onClick={() => void chooseFiles()}>选择文件</button>
                 <button className="ghost" onClick={() => void chooseFolder()}>文件夹</button>
+                <button className="ghost" onClick={() => void toggleWatch()}>{watching ? "停止监听" : "监听文件夹"}</button>
               </div>
               <section className={`auth-guide${credentials?.available ? " ready" : ""}${permissionRequired ? " required" : ""}`} aria-label="自动解密状态与使用说明">
                 <div className="auth-guide-head">
@@ -514,7 +599,7 @@ export default function App() {
                 >
                   <Plus size={12} />
                 </button>
-                <button className="clear" onClick={clearAll}>clear</button>
+                <button className="clear" disabled={running} onClick={clearAll}>clear</button>
               </div>
               <div className="qlist">
                 {visiblePaths.map((path) => {
@@ -534,14 +619,14 @@ export default function App() {
                           ? PHASE_LABEL[progress?.phase ?? ""] ?? "处理"
                           : job
                             ? job.ok
-                              ? job.format?.toUpperCase() || "OK"
+                              ? job.skipped ? "已跳过" : job.format?.toUpperCase() || "OK"
                               : "失败"
                             : info?.supported === false
                               ? "不可用"
                               : info?.format?.toUpperCase() || "…"}
                       </span>
                       {active && <span className="rbar" style={{ width: `${progress?.filePercent ?? 0}%` }} />}
-                      <button className="rm" title="移除" aria-label={`移除 ${basename(path)}`} onClick={() => removePath(path)}>
+                      <button className="rm" disabled={running} title="移除" aria-label={`移除 ${basename(path)}`} onClick={() => removePath(path)}>
                         <X size={13} />
                       </button>
                     </div>
@@ -556,6 +641,24 @@ export default function App() {
         </section>
 
         <aside className="side">
+          <div className="card automation">
+            <p className="ch">自动处理</p>
+            <button className="ghost watch-toggle" disabled={running || polling.current} onClick={() => void toggleWatch()}>{watching ? "停止监听" : "选择并监听下载目录"}</button>
+            <p className="setting-note" title={watchDir}>{watching ? "正在监听：" : "上次目录："}{watchDir || "未选择"}</p>
+            <p className="setting-note">每 2 秒检查一次，新文件连续两次保持稳定后自动处理。已有文件请手动添加。</p>
+            {watchPending.length > 0 && <p className="setting-note" role="status">等待处理 {watchPending.length} 个文件{!running ? "；加密文件需登录 QQ 音乐或填写 ekey" : ""}</p>}
+            <button className="opt first" aria-pressed={skipExisting} onClick={() => setSkipExisting(v => !v)}>
+              <span className="box"><Check size={9} strokeWidth={4} /></span><span>跳过已转换文件</span>
+            </button>
+          </div>
+          <div className="card automation">
+            <p className="ch">输出命名</p>
+            <select aria-label="命名模板预设" value={["", "{artist} - {title}", "{album}/{track} {title}"].includes(outputTemplate) ? outputTemplate : "custom"} onChange={event => setOutputTemplate(event.target.value === "custom" ? "{filename}" : event.target.value)}>
+              <option value="">保留源文件名</option><option value="{artist} - {title}">歌手 - 歌名</option><option value="{album}/{track} {title}">专辑 / 序号 歌名</option><option value="custom">自定义</option>
+            </select>
+            <input aria-label="自定义命名模板" value={outputTemplate} onChange={event => setOutputTemplate(event.target.value)} placeholder="{artist} - {title}" spellCheck={false} />
+            <p className="setting-note">支持 {"{filename} {artist} {title} {album} {track}"}，/ 创建子目录。命名和监听均保留源文件，生成副本。</p>
+          </div>
           {/* 只在有加密文件（或队列为空、还不知道）时需要 ekey */}
           {(hasEnc || !hasPlain) && (
             <div className="card">
@@ -630,7 +733,7 @@ export default function App() {
 
           <div className="card">
             <p className="ch">output</p>
-            {(hasEnc || !hasPlain || plainCopy || plainWritesNew) && (
+            {(hasEnc || !hasPlain || plainCopy || plainWritesNew || Boolean(outputTemplate.trim()) || watching) && (
               <button className="path" style={{ marginTop: 0 }} onClick={() => void chooseOutput()} title={outputDir || "与源文件相同"}>
                 <span className="chip">out</span>
                 <span className="pv">{outputDir || "同源目录"}</span>

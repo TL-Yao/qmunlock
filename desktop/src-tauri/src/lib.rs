@@ -3,6 +3,8 @@ mod core;
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(commands::BatchLock(tokio::sync::Mutex::new(())))
+        .manage(commands::WatchState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::check_credentials,
@@ -12,6 +14,8 @@ pub fn run() {
             commands::get_file_info,
             commands::scan_paths,
             commands::decrypt_paths,
+            commands::set_watch_directory,
+            commands::poll_watch_directory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running QM Unlock");

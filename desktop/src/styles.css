@@ -577,3 +577,12 @@ button.alert:hover { background: var(--gold-bg); filter: brightness(1.15); }
   .side { display: none; }
   .shell[data-state="empty"] .side, .shell[data-state="drag"] .side { display: none; }
 }
+
+/* Automation controls share the existing theme and scroll with the sidebar. */
+.automation select, .automation input { width: 100%; min-width: 0; margin-top: 8px; padding: 8px; border: 1px solid var(--rule); border-radius: 5px; background: var(--raised2); color: var(--ink); font: inherit; }
+.setting-note { margin: 8px 0 0; color: var(--ink3); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.watch-toggle { width: 100%; margin-top: 8px; }
+.shell[data-state="loaded"] .drop { overflow: auto; justify-content: flex-start; padding: 24px; }
+.shell[data-state="loaded"] .drop .halo { flex-shrink: 0; width: 96px; height: 96px; margin-bottom: 18px; }
+.shell[data-state="loaded"] .drop .halo img { width: 72px; height: 72px; }
+.drop .acts { flex-wrap: wrap; justify-content: center; }

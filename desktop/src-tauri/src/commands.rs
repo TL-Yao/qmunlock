@@ -1,9 +1,58 @@
 use crate::core::{
-    self, credentials, decrypt, ekey, tags, DecryptOptions, DecryptResult, Error, FileInfo,
-    ProgressEvent,
+    self, automation, credentials, decrypt, ekey, naming, tags, DecryptOptions, DecryptResult,
+    Error, FileInfo, ProgressEvent,
 };
 use std::path::{Path, PathBuf};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
+
+pub struct BatchLock(pub tokio::sync::Mutex<()>);
+#[derive(Default)]
+pub struct WatchState(pub std::sync::Mutex<Option<automation::FolderWatcher>>);
+
+fn history_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|p| p.join("processing-history.json"))
+}
+
+#[tauri::command]
+pub fn set_watch_directory(
+    state: tauri::State<WatchState>,
+    directory: Option<String>,
+) -> std::result::Result<(), String> {
+    let watcher = directory
+        .map(|p| automation::FolderWatcher::new(Path::new(&p)))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    *state.0.lock().map_err(|e| e.to_string())? = watcher;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn poll_watch_directory(
+    app: tauri::AppHandle,
+    state: tauri::State<WatchState>,
+    batch: tauri::State<BatchLock>,
+    output_dir: Option<String>,
+) -> std::result::Result<Vec<String>, String> {
+    let Ok(_batch) = batch.0.try_lock() else {
+        return Ok(Vec::new());
+    };
+    let mut state = state.0.lock().map_err(|e| e.to_string())?;
+    let Some(watcher) = state.as_mut() else {
+        return Ok(Vec::new());
+    };
+    let mut excluded = history_path(&app)
+        .map(|p| automation::History::load(&p).outputs())
+        .unwrap_or_default();
+    if let Some(output) = output_dir.and_then(|p| std::fs::canonicalize(p).ok()) {
+        if output != watcher.root() && output.starts_with(watcher.root()) {
+            excluded.push(output);
+        }
+    }
+    watcher.poll(&excluded).map_err(|e| e.to_string())
+}
 
 #[tauri::command]
 pub fn check_credentials() -> core::CredentialStatus {
@@ -185,7 +234,35 @@ pub async fn decrypt_paths(
     output_dir: Option<String>,
     options: DecryptOptions,
 ) -> Vec<DecryptResult> {
+    let batch = app.state::<BatchLock>();
+    let _batch = batch.0.lock().await;
     let inputs = expand_paths(paths);
+    if let Some(template) = options
+        .output_template
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        if let Err(error) = naming::validate(template.trim()) {
+            return inputs
+                .iter()
+                .map(|input| DecryptResult {
+                    input: input.display().to_string(),
+                    output: None,
+                    ok: false,
+                    skipped: false,
+                    format: None,
+                    error: Some(error.to_string()),
+                    cover: None,
+                    lyrics: None,
+                })
+                .collect();
+        }
+    }
+    let store = history_path(&app);
+    let mut history = store
+        .as_deref()
+        .map(automation::History::load)
+        .unwrap_or_default();
     let output = output_dir.as_deref().map(Path::new);
     let credentials = if options
         .manual_ekey
@@ -201,16 +278,58 @@ pub async fn decrypt_paths(
     let mut results = Vec::with_capacity(inputs.len());
     let total = inputs.len().max(1) as u64;
     for (index, input) in inputs.iter().enumerate() {
-        let result = decrypt_one(
-            &app,
-            input,
-            output,
-            &options,
-            credentials.as_ref(),
-            (index + 1) as u64,
-            total,
-        )
-        .await;
+        let source_version = automation::stamp(input);
+        let key = automation::job_key(input, output, &options);
+        let existing = options
+            .skip_existing
+            .then(|| {
+                history
+                    .lookup_output(input)
+                    .or_else(|| history.lookup(&key, input))
+                    .or_else(|| {
+                        if history.knows_input(input) {
+                            None
+                        } else {
+                            automation::legacy_output(input, output, &options)
+                        }
+                    })
+            })
+            .flatten();
+        let result = if let Some(result) = existing {
+            emit_frac(
+                &app,
+                "skip",
+                &input.display().to_string(),
+                (index + 1) as u64,
+                total,
+                1.0,
+                "已跳过已有输出",
+            );
+            result
+        } else {
+            decrypt_one(
+                &app,
+                input,
+                output,
+                &options,
+                credentials.as_ref(),
+                (index + 1) as u64,
+                total,
+            )
+            .await
+        };
+        let in_place = result
+            .output
+            .as_deref()
+            .is_some_and(|p| std::fs::canonicalize(p).ok() == std::fs::canonicalize(input).ok());
+        if in_place || source_version == automation::stamp(input) {
+            history.record(key, input, &result);
+        }
+        if let Some(store) = store.as_deref() {
+            if let Err(error) = history.save(store) {
+                eprintln!("无法保存处理记录：{error}");
+            }
+        }
         results.push(result);
     }
     emit_frac(&app, "complete", "", total, total, 1.0, "任务处理完成");
@@ -240,6 +359,7 @@ async fn decrypt_one(
                 input: input_name,
                 output: None,
                 ok: false,
+                skipped: false,
                 format: None,
                 error: Some(error),
                 cover: None,
@@ -309,6 +429,38 @@ async fn decrypt_one(
     .await;
     match run {
         Ok((output, format)) => {
+            let embedded = if naming::enabled(options.output_template.as_deref()) {
+                tags::read_embedded_tags(&output)
+            } else {
+                None
+            };
+            let meta = if naming::enabled(options.output_template.as_deref()) {
+                tags::resolve_song(&footer.song_mid).await.ok()
+            } else {
+                None
+            };
+            let output = match naming::apply(
+                &output,
+                input,
+                output_dir,
+                options.output_template.as_deref(),
+                meta.as_ref(),
+                embedded.as_ref(),
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    return DecryptResult {
+                        input: input_name,
+                        output: Some(output.display().to_string()),
+                        ok: false,
+                        skipped: false,
+                        format: Some(format),
+                        error: Some(format!("命名失败：{error}")),
+                        cover: None,
+                        lyrics: None,
+                    }
+                }
+            };
             let song_mid = footer.song_mid.clone();
             let cover = if options.embed_cover {
                 let notes = decorate_output(
@@ -348,6 +500,7 @@ async fn decrypt_one(
                 input: input_name,
                 output: Some(output.display().to_string()),
                 ok: true,
+                skipped: false,
                 format: Some(format),
                 error: None,
                 cover,
@@ -358,6 +511,7 @@ async fn decrypt_one(
             input: input_name,
             output: None,
             ok: false,
+            skipped: false,
             format: None,
             error: Some(error.to_string()),
             cover: None,
@@ -464,7 +618,7 @@ fn plain_target(
             &stem(),
             format,
         )))
-    } else if options.plain_copy {
+    } else if options.plain_copy || naming::enabled(options.output_template.as_deref()) {
         Ok(PlainTarget::Copy(unique_copy_target(input, &dir())))
     } else {
         Ok(PlainTarget::InPlace)
@@ -506,7 +660,7 @@ async fn enhance_plain(
                     std::fs::create_dir_all(dir)?;
                 }
                 std::fs::copy(input, &dest)?;
-                converted = dest.extension() != input.extension();
+                converted = true;
                 dest
             }
             PlainTarget::Transcode(dest) => {
@@ -569,12 +723,28 @@ async fn enhance_plain(
         let meta = match matched {
             Ok(meta) => meta,
             // 转换产物本身就是用户要的结果：曲库匹配失败只记为备注，不把整个任务判为失败
-            Err(error) if converted => {
+            Err(error) if converted || naming::enabled(options.output_template.as_deref()) => {
+                let target = naming::apply(
+                    &target,
+                    input,
+                    output_dir,
+                    options.output_template.as_deref(),
+                    None,
+                    embedded.as_ref(),
+                )?;
                 return Ok((target, format, vec![format!("未匹配曲库：{error}")], None));
             }
             Err(error) => return Err(error),
         };
 
+        let target = naming::apply(
+            &target,
+            input,
+            output_dir,
+            options.output_template.as_deref(),
+            Some(&meta),
+            embedded.as_ref(),
+        )?;
         let mut notes: Vec<String> = Vec::new();
         // 「封面」= FLAC / MP3 内嵌封面 + 访达自定义图标（macOS）。
         let image = if options.embed_cover {
@@ -649,6 +819,7 @@ async fn enhance_plain(
             input: input_name,
             output: Some(target.display().to_string()),
             ok: true,
+            skipped: false,
             format: Some(format),
             error: None,
             cover: (!notes.is_empty()).then(|| notes.join(" · ")),
@@ -658,6 +829,7 @@ async fn enhance_plain(
             input: input_name,
             output: None,
             ok: false,
+            skipped: false,
             format: None,
             error: Some(error.to_string()),
             cover: None,
@@ -978,6 +1150,8 @@ mod tests {
             lyrics_dir: None,
             embed_synced_lyrics: false,
             plain_copy,
+            skip_existing: true,
+            output_template: None,
         }
     }
 
